@@ -21,7 +21,6 @@
 
 import math
 from typing import List, Optional, Tuple, Union
-
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -53,7 +52,7 @@ if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
 
 logger = logging.get_logger(__name__)
-
+logger.setLevel(logging.INFO)
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen1.5-MoE-A2.7B"
 _CONFIG_FOR_DOC = "Qwen2MoeConfig"
 
@@ -152,6 +151,7 @@ def load_balancing_loss_func(
     if attention_mask is None:
         # Compute the percentage of tokens routed to each experts
         tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+        # print("tokens_per_expert", tokens_per_expert)
 
         # Compute the average probability of routing to these experts
         router_prob_per_expert = torch.mean(routing_weights, dim=0)
@@ -288,6 +288,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 class Qwen2MoeMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
+        # logger.info("Initialize MoEMLP")
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
@@ -695,6 +696,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.shared_expert = Qwen2MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.expert_selected_times = torch.zeros(self.num_experts, dtype=torch.int64,device='cuda')
+
+    # def __del__(self):
+    #     logger.info(f"selected_experts total times: {self.expert_selected_times.tolist()}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -704,7 +709,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        # selected_experts (tokens, top_k)
+        
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        unq_selected_experts, counts = torch.unique(selected_experts, return_counts=True)
+        hot_experts = unq_selected_experts[counts.argmax()]
+        # logger.info(f"hot experts: {hot_experts}")
+        # logger.info(f"layer: {id(self)} selected_experts: {selected_experts.reshape(-1).tolist()}")
+        # self.expert_selected_times = self.expert_selected_times.to(selected_experts.device)
+        # self.expert_selected_times[selected_experts.reshape(-1)] += 1
+        # logger.info(f"selected_experts shape: {selected_experts.shape}")
+        # logger.info(f"selected_experts total times: {self.expert_selected_times.tolist()}")
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
@@ -713,7 +728,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-
+        # Fei
+        # hidden_states = self.quantize_dequantize_bfloat16(hidden_states)
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
@@ -727,20 +743,119 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_state = self.quantize_dequantize_bfloat16(current_state)
+            # if expert_idx == hot_experts:
+            #     current_state = self.quantize_dequantize_fp8(current_state)
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
+            # if expert_idx == hot_experts:
+            #     current_hidden_states = self.quantize_dequantize_fp8(current_hidden_states)
+            
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
+            current_hidden_states = self.quantize_dequantize_bfloat16(current_hidden_states,before_expert=False)
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
         shared_expert_output = self.shared_expert(hidden_states)
+        # Fei
+        # final_hidden_states = self.quantize_dequantize_fp8(final_hidden_states,before_expert=False)
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-
+        
         final_hidden_states = final_hidden_states + shared_expert_output
-
+        
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
+    def quantize_dequantize_bfloat16(self, tensor_bfloat16, before_expert=True):
+        # Ensure the tensor is of type bfloat16
+        original_type = tensor_bfloat16.dtype
+
+        # Ensure the tensor is not empty
+        if tensor_bfloat16.numel() == 0:
+            return tensor_bfloat16
+
+        # Deal with the outliers
+        percent = 95.0
+        lower_percentile = (100.0 - percent) / 2.0
+        upper_percentile = 100.0 - lower_percentile
+        
+        # calculate the bound
+        min_val = torch.quantile(tensor_bfloat16.to(torch.float32), lower_percentile / 100.0, dim=1, keepdim=True)
+        max_val = torch.quantile(tensor_bfloat16.to(torch.float32), upper_percentile / 100.0, dim=1, keepdim=True)
+        
+        # Save the tensor before quantization
+        
+        tensor_bfloat16 = torch.clamp(tensor_bfloat16, min=min_val, max=max_val)
+        torch.save(tensor_bfloat16.cpu(), f"tensor_before_quantization_{before_expert}.pt")
+        # Step 1: Normalize the bfloat16 values to fit into the range of int8
+        # min_val = tensor_bfloat16.amin(dim=tuple(range(tensor_bfloat16.ndim)), keepdim=True)
+        # max_val = tensor_bfloat16.amax(dim=tuple(range(tensor_bfloat16.ndim)), keepdim=True)
+
+        scale = (max_val - min_val).float()
+        scale[scale == 0] = 1.0
+
+        # Normalize the tensor
+        normalized_bfloat16 = (tensor_bfloat16 - min_val) / scale
+
+        # Step 2: Quantize the normalized values into int8
+        tensor_qint8 = (normalized_bfloat16 * 255 - 128).round().clamp(-128, 127).to(torch.int8)
+
+        # Step 3: Dequantize the int8 values back to bfloat16
+        dequantized_bfloat16 = (tensor_qint8.float() + 128) / 255 * scale + min_val
+        mse_loss_int8 = F.mse_loss(tensor_bfloat16, dequantized_bfloat16.to(original_type))
+
+        # if before_expert:
+        #     logger.info(f"MSE Loss for 8-bit quantization before: {mse_loss_int8}")
+        # else:
+        #     logger.info(f"MSE Loss for 8-bit quantization after: {mse_loss_int8}")
+
+        # Save the tensor after quantization and dequantization
+        torch.save(dequantized_bfloat16.cpu(), f"tensor_after_quantization_{before_expert}.pt")
+
+        return dequantized_bfloat16.to(original_type)
+
+    def quantize_dequantize_fp8(self, tensor, before_expert=True):
+        # Save the original tensor's data type
+        original_type = tensor.dtype
+        
+        # Ensure the tensor is not empty
+        if tensor.numel() == 0:
+            return tensor
+        torch.save(tensor.cpu(), f"fp8tensor_before_quantization_{before_expert}.pt")
+
+        # FP8 configuration: Assume using 4-bit exponent and 3-bit mantissa
+        exponent_bits = 4
+        mantissa_bits = 3
+
+        # Step 1: Clamp tensor values to fit FP8 representation range
+        max_exp = 2 ** (exponent_bits - 1) - 1
+        min_exp = -2 ** (exponent_bits - 1)
+        max_val = (2 ** mantissa_bits) * (2 ** max_exp)
+        min_val = (2 ** mantissa_bits) * (2 ** min_exp)
+        tensor = torch.clamp(tensor, min_val, max_val)
+
+        # Step 2: Calculate FP8 exponent and mantissa
+        exponent = torch.floor(torch.log2(torch.abs(tensor)))
+        mantissa = torch.round((torch.abs(tensor) / (2 ** exponent)) * (2 ** mantissa_bits))
+
+        # Handle cases where the value is zero
+        exponent[tensor == 0] = 0
+        mantissa[tensor == 0] = 0
+
+        # Reconstruct the tensor in FP8 representation
+        tensor_fp8 = torch.sign(tensor) * mantissa * (2 ** exponent)
+
+        # Step 3: Dequantize back to the original FP32/BFloat16 format
+        dequantized_tensor = tensor_fp8 * (2 ** (-mantissa_bits)) * (2 ** exponent)
+
+        # Calculate MSE loss between original and dequantized tensors
+        mse_loss_fp8 = F.mse_loss(tensor, dequantized_tensor.to(original_type))
+        if before_expert:
+            logger.info(f"MSE Loss for 8-bit quantization before: {mse_loss_fp8}")
+        else:
+            logger.info(f"MSE Loss for 8-bit quantization after: {mse_loss_fp8}")
+        torch.save(dequantized_tensor.cpu(), f"fp8tensor_after_quantization_{before_expert}.pt")
+        # Step 4: Ensure the output tensor retains the original precision format
+        return dequantized_tensor.to(original_type)
 
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen2MoeConfig, layer_idx: int):
