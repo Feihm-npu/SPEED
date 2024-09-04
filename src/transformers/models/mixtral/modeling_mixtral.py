@@ -718,7 +718,7 @@ class MixtralSparseMoeBlock(nn.Module):
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         unq_selected_experts, counts = torch.unique(selected_experts, return_counts=True)
         hot_experts = unq_selected_experts[counts.argmax()]
-        logger.info(f"layer: {id(self)} selected_experts: {selected_experts.reshape(-1).tolist()}")
+        # logger.info(f"layer: {id(self)} selected_experts: {selected_experts.reshape(-1).tolist()}")
 
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
@@ -742,11 +742,11 @@ class MixtralSparseMoeBlock(nn.Module):
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            # if expert_idx == hot_experts:
-            current_state = self.quantize_dequantize_fp8(current_state)
+            if expert_idx == hot_experts:
+                current_state = self.quantize_dequantize_bfloat16(current_state,before_expert=True)
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-            # if expert_idx == hot_experts:
-            current_hidden_states = self.quantize_dequantize_fp8(current_hidden_states)
+            if expert_idx == hot_experts:
+                current_hidden_states = self.quantize_dequantize_bfloat16(current_hidden_states, before_expert=False)
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
@@ -754,20 +754,31 @@ class MixtralSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
     
-    def quantize_dequantize_bfloat16(self, tensor_bfloat16):
+    def quantize_dequantize_bfloat16(self, tensor_bfloat16, before_expert=True):
         # Ensure the tensor is of type bfloat16
-        # assert tensor_bfloat16.dtype == torch.bfloat16, f"Expected bfloat16, but got {tensor_bfloat16.dtype}"
         original_type = tensor_bfloat16.dtype
+
         # Ensure the tensor is not empty
         if tensor_bfloat16.numel() == 0:
             return tensor_bfloat16
 
+        # Deal with the outliers
+        percent = 95.0
+        lower_percentile = (100.0 - percent) / 2.0
+        upper_percentile = 100.0 - lower_percentile
+        
+        # calculate the bound
+        # min_val = torch.quantile(tensor_bfloat16.to(torch.float32), lower_percentile / 100.0, dim=1, keepdim=True)
+        # max_val = torch.quantile(tensor_bfloat16.to(torch.float32), upper_percentile / 100.0, dim=1, keepdim=True)
+        
+        # Save the tensor before quantization
+        
+        # tensor_bfloat16 = torch.clamp(tensor_bfloat16, min=min_val, max=max_val)
+        # torch.save(tensor_bfloat16.cpu(), f"tensor_before_quantization_{before_expert}.pt")
         # Step 1: Normalize the bfloat16 values to fit into the range of int8
-        # Calculate min and max along the appropriate dimensions
         min_val = tensor_bfloat16.amin(dim=tuple(range(tensor_bfloat16.ndim)), keepdim=True)
         max_val = tensor_bfloat16.amax(dim=tuple(range(tensor_bfloat16.ndim)), keepdim=True)
 
-        # Avoid division by zero if min and max are the same
         scale = (max_val - min_val).float()
         scale[scale == 0] = 1.0
 
@@ -779,43 +790,60 @@ class MixtralSparseMoeBlock(nn.Module):
 
         # Step 3: Dequantize the int8 values back to bfloat16
         dequantized_bfloat16 = (tensor_qint8.float() + 128) / 255 * scale + min_val
+        mse_loss_int8 = F.mse_loss(tensor_bfloat16, dequantized_bfloat16.to(original_type))
+
+        if before_expert:
+            logger.info(f"MSE Loss for 8-bit quantization before: {mse_loss_int8}")
+        else:
+            logger.info(f"MSE Loss for 8-bit quantization after: {mse_loss_int8}")
+
+        # Save the tensor after quantization and dequantization
+        # torch.save(dequantized_bfloat16.cpu(), f"tensor_after_quantization_{before_expert}.pt")
 
         return dequantized_bfloat16.to(original_type)
 
-    def quantize_dequantize_fp8(self, tensor):
-        # 保存原始张量的数据类型
+    def quantize_dequantize_fp8(self, tensor, before_expert=True):
+        # Save the original tensor's data type
         original_type = tensor.dtype
         
-        # 确保张量不为空
+        # Ensure the tensor is not empty
         if tensor.numel() == 0:
             return tensor
+        torch.save(tensor.cpu(), f"fp8tensor_before_quantization_{before_expert}.pt")
 
-        # FP8配置：假设使用4位指数和3位尾数
+        # FP8 configuration: Assume using 4-bit exponent and 3-bit mantissa
         exponent_bits = 4
         mantissa_bits = 3
 
-        # Step 1: 裁剪张量值以适应FP8的表示范围
+        # Step 1: Clamp tensor values to fit FP8 representation range
         max_exp = 2 ** (exponent_bits - 1) - 1
         min_exp = -2 ** (exponent_bits - 1)
         max_val = (2 ** mantissa_bits) * (2 ** max_exp)
         min_val = (2 ** mantissa_bits) * (2 ** min_exp)
         tensor = torch.clamp(tensor, min_val, max_val)
 
-        # Step 2: 计算FP8的指数和尾数
+        # Step 2: Calculate FP8 exponent and mantissa
         exponent = torch.floor(torch.log2(torch.abs(tensor)))
         mantissa = torch.round((torch.abs(tensor) / (2 ** exponent)) * (2 ** mantissa_bits))
 
-        # 处理数值为零的情况
+        # Handle cases where the value is zero
         exponent[tensor == 0] = 0
         mantissa[tensor == 0] = 0
 
-        # 重新组合符号、指数和尾数，形成FP8表示
+        # Reconstruct the tensor in FP8 representation
         tensor_fp8 = torch.sign(tensor) * mantissa * (2 ** exponent)
 
-        # Step 3: 反量化回原始的FP32/BFloat16格式
-        dequantized_tensor = tensor_fp8  # 在这个模拟中，FP8张量直接映射回原始张量
+        # Step 3: Dequantize back to the original FP32/BFloat16 format
+        dequantized_tensor = tensor_fp8 * (2 ** (-mantissa_bits)) * (2 ** exponent)
 
-        # Step 4: 确保输出张量保留原始的精度格式
+        # Calculate MSE loss between original and dequantized tensors
+        mse_loss_fp8 = F.mse_loss(tensor, dequantized_tensor.to(original_type))
+        if before_expert:
+            logger.info(f"MSE Loss for 8-bit quantization before: {mse_loss_fp8}")
+        else:
+            logger.info(f"MSE Loss for 8-bit quantization after: {mse_loss_fp8}")
+        torch.save(dequantized_tensor.cpu(), f"fp8tensor_after_quantization_{before_expert}.pt")
+        # Step 4: Ensure the output tensor retains the original precision format
         return dequantized_tensor.to(original_type)
 
 
