@@ -133,8 +133,16 @@ class MixtralConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
+        Qmode=0,
+        NumHotExperts=1,
+        Qpre=None,
         **kwargs,
     ):
+        # Customize
+        self.Qmode = Qmode
+        self.NumHotExperts = NumHotExperts
+        self.Qpre=Qpre
+        ###
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
